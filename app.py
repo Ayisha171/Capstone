@@ -1,6 +1,7 @@
 ﻿import os
 import json
 import sqlite3
+import gc
 from datetime import datetime
 from werkzeug.utils import secure_filename
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session, send_file
@@ -16,6 +17,7 @@ import threading
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 torch = None
 transforms = None
@@ -135,6 +137,40 @@ transform = None
 _model_lock = threading.Lock()
 
 
+def resolve_model_path():
+    """Choose the lightest available model artifact first."""
+    configured_path = os.environ.get('MODEL_PATH', '').strip()
+    candidates = []
+
+    if configured_path:
+        if configured_path.endswith('.pt'):
+            candidates.append(configured_path)
+        elif configured_path.endswith('.pth'):
+            candidates.append(configured_path[:-4] + '_scripted.pt')
+            candidates.append(configured_path)
+        else:
+            candidates.append(configured_path)
+
+    candidates.extend([
+        os.path.join('models', 'cattle_disease_vit_model_int8_scripted.pt'),
+        os.path.join('models', 'cattle_disease_vit_model_int8.pth'),
+        os.path.join('models', 'cattle_disease_vit_model.pth'),
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.exists(normalized):
+            return normalized
+
+    return os.path.normpath(configured_path) if configured_path else os.path.join('models', 'cattle_disease_vit_model_int8_scripted.pt')
+
+
 def load_model():
     global MODEL_BACKEND, MODEL_LOADED, MODEL_LOAD_ERROR, model, device, transform
     global torch, transforms, models
@@ -154,48 +190,57 @@ def load_model():
             import torch  # noqa: F401
             import torchvision.transforms as transforms  # noqa: F401
             from torchvision import models  # noqa: F401
+            torch.set_num_threads(1)
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
         except Exception as e:
             MODEL_LOAD_ERROR = f"torch/torchvision import failed: {e}"
             print(f"WARNING: {MODEL_LOAD_ERROR}")
             return False
 
         try:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            device = torch.device('cpu')
+            model_path = resolve_model_path()
+            print(f"INFO: Loading model from {model_path}")
 
-            model_path = os.environ.get('MODEL_PATH')
-            if not model_path:
-                int8_path = os.path.join('models', 'cattle_disease_vit_model_int8.pth')
-                model_path = int8_path if os.path.exists(int8_path) else os.path.join('models', 'cattle_disease_vit_model.pth')
-
-            state_dict = torch.load(model_path, map_location=device)
-            num_classes = len(class_names)
-            is_transformers = any(key.startswith('vit.') for key in state_dict.keys())
-
-            if is_transformers:
-                from transformers import ViTConfig, ViTForImageClassification
-
-                config = ViTConfig(
-                    num_labels=num_classes,
-                    image_size=model_config.get('image_size', 224),
-                    num_channels=3
-                )
-                model = ViTForImageClassification(config)
-                MODEL_BACKEND = 'transformers'
+            if model_path.endswith('.pt'):
+                model = torch.jit.load(model_path, map_location=device)
+                MODEL_BACKEND = 'torchscript'
             else:
-                model = models.vit_b_16(weights=None)
-                model.heads = torch.nn.Linear(model.heads.head.in_features, num_classes)
-                MODEL_BACKEND = 'torchvision'
+                state_dict = torch.load(model_path, map_location=device, mmap=True)
+                num_classes = len(class_names)
+                is_transformers = any(key.startswith('vit.') for key in state_dict.keys())
 
-            if model_path.endswith('_int8.pth'):
-                # Quantized weights require a quantized model structure before loading.
-                model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+                if is_transformers:
+                    from transformers import ViTConfig, ViTForImageClassification
 
-            model.load_state_dict(state_dict, strict=True)
+                    config = ViTConfig(
+                        num_labels=num_classes,
+                        image_size=model_config.get('image_size', 224),
+                        num_channels=3
+                    )
+                    model = ViTForImageClassification(config)
+                    MODEL_BACKEND = 'transformers'
+                else:
+                    model = models.vit_b_16(weights=None)
+                    model.heads = torch.nn.Linear(model.heads.head.in_features, num_classes)
+                    MODEL_BACKEND = 'torchvision'
+
+                if model_path.endswith('_int8.pth'):
+                    # Quantized weights require a quantized model structure before loading.
+                    model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+
+                model.load_state_dict(state_dict, strict=True)
+                del state_dict
+                gc.collect()
+
             model = model.to(device)
             model.eval()
 
             image_size = model_config.get('image_size', 224)
-            if MODEL_BACKEND == 'transformers':
+            if MODEL_BACKEND in {'transformers', 'torchscript'}:
                 normalize_mean = [0.5, 0.5, 0.5]
                 normalize_std = [0.5, 0.5, 0.5]
             else:
