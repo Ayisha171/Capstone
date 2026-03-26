@@ -43,6 +43,39 @@ with open('models/model_config.json', 'r') as f:
 with open('models/class_names.json', 'r') as f:
     class_names = json.load(f)
 
+CATTLE_REFERENCE_IMAGES = [
+    os.path.join('static', 'uploads', '20260119_141755_Cow_mouth_with_teeth_1.jpg'),
+    os.path.join('static', 'uploads', '20260119_142111_Cows_head_open_mouth_14.jpg'),
+    os.path.join('static', 'uploads', '20260119_142939_2_day_vesicle_steer_mouth.jpg'),
+    os.path.join('static', 'uploads', '20260119_155733_Diseased_foot_9.jpg'),
+    os.path.join('static', 'uploads', '20260119_155954_Drooling_cow_4.jpg'),
+    os.path.join('static', 'uploads', '20260120_111821_3_day_vesicle_steer_tongue.jpg'),
+    os.path.join('static', 'uploads', '20260120_111837_4_day_lesions_steer_tongue_and_gum_.jpg'),
+    os.path.join('static', 'uploads', '20260120_113200_Non-diseased_muzzle_19_with_tongue.jpg'),
+    os.path.join('static', 'uploads', '20260120_155238_Calf_underside_of_tongue_3.jpg'),
+]
+
+
+def get_env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+CATTLE_SIMILARITY_THRESHOLD = get_env_float('CATTLE_SIMILARITY_THRESHOLD', 0.72)
+CATTLE_AVG_SIMILARITY_THRESHOLD = get_env_float('CATTLE_AVG_SIMILARITY_THRESHOLD', 0.68)
+CATTLE_SIMILARITY_TOPK = max(1, get_env_int('CATTLE_SIMILARITY_TOPK', 3))
+PREDICTION_CONFIDENCE_FLOOR = get_env_float('PREDICTION_CONFIDENCE_FLOOR', 60.0)
+NON_CATTLE_ERROR_CODE = 'non_cattle'
+
 # Treatment recommendations database
 TREATMENT_RECOMMENDATIONS = {
     "Healthy": {
@@ -135,6 +168,9 @@ model = None
 device = None
 transform = None
 _model_lock = threading.Lock()
+_reference_lock = threading.Lock()
+CATTLE_REFERENCE_EMBEDDINGS = None
+CATTLE_REFERENCE_ERROR = None
 
 
 def resolve_model_path():
@@ -312,6 +348,15 @@ def get_translation(key, lang='en'):
     """Get translated text"""
     return translations.get(lang, {}).get(key, translations['en'].get(key, key))
 
+
+def resolve_language(default='en'):
+    """Persist a requested language when present and return the active language."""
+    requested = request.args.get('lang') or request.form.get('lang')
+    if requested in translations:
+        session['language'] = requested
+        return requested
+    return session.get('language', default)
+
 def get_treatment_recommendation(disease, lang='en'):
     """Get treatment recommendation for disease"""
     return TREATMENT_RECOMMENDATIONS.get(disease, {}).get(lang, "Consult a veterinarian for proper treatment.")
@@ -330,22 +375,166 @@ def hash_identifier(value):
     salted = f"{value_str}|{app.config['SECRET_KEY']}"
     return hashlib.sha256(salted.encode('utf-8')).hexdigest()[:10]
 
-def predict_image(image_path):
-    """Predict disease from image"""
+def get_non_cattle_message(lang='en'):
+    return get_translation('error_non_cattle', lang)
+
+
+def get_wrapped_model():
+    """TorchScript builds are wrapped in a small forwarding module."""
+    return getattr(model, 'm', model)
+
+
+def get_vit_backbone():
+    wrapped_model = get_wrapped_model()
+    return getattr(wrapped_model, 'vit', None)
+
+
+def get_classification_head():
+    wrapped_model = get_wrapped_model()
+    return getattr(wrapped_model, 'classifier', None)
+
+
+def extract_sequence_output(image_tensor):
+    backbone = get_vit_backbone()
+    if backbone is None:
+        return None
+
+    if MODEL_BACKEND == 'transformers':
+        outputs = backbone(pixel_values=image_tensor)
+    else:
+        outputs = backbone(image_tensor)
+
+    if hasattr(outputs, 'last_hidden_state'):
+        return outputs.last_hidden_state
+    if isinstance(outputs, (tuple, list)) and outputs:
+        return outputs[0]
+    return outputs
+
+
+def extract_embedding(image_tensor):
+    sequence_output = extract_sequence_output(image_tensor)
+    if sequence_output is None or not torch.is_tensor(sequence_output):
+        return None, None
+
+    cls_embedding = sequence_output[:, 0, :]
+    normalized_embedding = torch.nn.functional.normalize(cls_embedding, p=2, dim=1)
+    return normalized_embedding, cls_embedding
+
+
+def get_cattle_reference_embeddings():
+    global CATTLE_REFERENCE_EMBEDDINGS, CATTLE_REFERENCE_ERROR
+
+    if CATTLE_REFERENCE_EMBEDDINGS is not None:
+        return CATTLE_REFERENCE_EMBEDDINGS
+    if CATTLE_REFERENCE_ERROR:
+        return None
+
+    with _reference_lock:
+        if CATTLE_REFERENCE_EMBEDDINGS is not None:
+            return CATTLE_REFERENCE_EMBEDDINGS
+        if CATTLE_REFERENCE_ERROR:
+            return None
+
+        if MODEL_BACKEND not in {'torchscript', 'transformers'}:
+            CATTLE_REFERENCE_ERROR = f'Embedding validation is not available for backend: {MODEL_BACKEND}'
+            return None
+
+        available_paths = [path for path in CATTLE_REFERENCE_IMAGES if os.path.exists(path)]
+        if not available_paths:
+            CATTLE_REFERENCE_ERROR = 'No cattle reference images were found for validation.'
+            return None
+
+        embeddings = []
+        with torch.no_grad():
+            for path in available_paths:
+                try:
+                    image = Image.open(path).convert('RGB')
+                    image_tensor = transform(image).unsqueeze(0).to(device)
+                    normalized_embedding, _ = extract_embedding(image_tensor)
+                    if normalized_embedding is not None:
+                        embeddings.append(normalized_embedding.cpu())
+                except Exception as exc:
+                    print(f'WARNING: Failed to embed cattle reference image {path}: {exc}')
+
+        if not embeddings:
+            CATTLE_REFERENCE_ERROR = 'Reference embeddings could not be built.'
+            return None
+
+        CATTLE_REFERENCE_EMBEDDINGS = torch.cat(embeddings, dim=0).to(device)
+        print(f'INFO: Loaded {CATTLE_REFERENCE_EMBEDDINGS.shape[0]} cattle reference embeddings')
+        return CATTLE_REFERENCE_EMBEDDINGS
+
+
+def validate_cattle_image(image_tensor):
+    reference_embeddings = get_cattle_reference_embeddings()
+    if reference_embeddings is None:
+        return {
+            'valid': True,
+            'skipped': True,
+            'reason': CATTLE_REFERENCE_ERROR or 'Reference validation unavailable'
+        }
+
+    normalized_embedding, cls_embedding = extract_embedding(image_tensor)
+    if normalized_embedding is None or cls_embedding is None:
+        return {
+            'valid': True,
+            'skipped': True,
+            'reason': 'Image embedding could not be extracted'
+        }
+
+    query_embedding = normalized_embedding[0]
+    similarities = torch.matmul(reference_embeddings, query_embedding)
+    top_k = min(CATTLE_SIMILARITY_TOPK, similarities.shape[0])
+    top_scores = torch.topk(similarities, k=top_k).values
+    max_similarity = float(top_scores[0].item())
+    avg_similarity = float(top_scores.mean().item())
+    is_valid = (
+        max_similarity >= CATTLE_SIMILARITY_THRESHOLD or
+        avg_similarity >= CATTLE_AVG_SIMILARITY_THRESHOLD
+    )
+
+    return {
+        'valid': is_valid,
+        'skipped': False,
+        'max_similarity': round(max_similarity, 4),
+        'avg_similarity': round(avg_similarity, 4),
+        'cls_embedding': cls_embedding
+    }
+
+
+def predict_image(image_path, lang='en'):
+    """Predict disease from image after confirming the upload looks like cattle."""
     if not load_model():
         message = 'Model not loaded. Please add trained model file.'
         if MODEL_LOAD_ERROR:
             message = f"Model not loaded. {MODEL_LOAD_ERROR}"
         return {'error': message}
-    
+
     try:
         image = Image.open(image_path).convert('RGB')
         image_tensor = transform(image).unsqueeze(0).to(device)
-        
+
         with torch.no_grad():
-            if MODEL_BACKEND == 'transformers':
-                outputs = model(pixel_values=image_tensor)
-                logits = outputs.logits
+            validation = validate_cattle_image(image_tensor)
+
+            if not validation['valid']:
+                return {
+                    'error': get_non_cattle_message(lang),
+                    'error_code': NON_CATTLE_ERROR_CODE,
+                    'validation': {
+                        'max_similarity': validation.get('max_similarity'),
+                        'avg_similarity': validation.get('avg_similarity')
+                    }
+                }
+
+            if MODEL_BACKEND in {'transformers', 'torchscript'}:
+                cls_embedding = validation.get('cls_embedding')
+                if cls_embedding is None:
+                    _, cls_embedding = extract_embedding(image_tensor)
+                classifier = get_classification_head()
+                if classifier is None or cls_embedding is None:
+                    return {'error': 'Model classifier is not available for prediction.'}
+                logits = classifier(cls_embedding)
             else:
                 logits = model(image_tensor)
 
@@ -354,11 +543,18 @@ def predict_image(image_path):
 
         predicted_class = normalize_prediction(class_names[predicted.item()])
         confidence_score = confidence.item() * 100
-        
-        # Get all class probabilities
-        all_probs = {normalize_prediction(class_names[i]): float(probabilities[0][i] * 100) 
-                     for i in range(len(class_names))}
-        
+
+        if validation.get('skipped') and confidence_score < PREDICTION_CONFIDENCE_FLOOR:
+            return {
+                'error': get_non_cattle_message(lang),
+                'error_code': NON_CATTLE_ERROR_CODE
+            }
+
+        all_probs = {
+            normalize_prediction(class_names[i]): float(probabilities[0][i] * 100)
+            for i in range(len(class_names))
+        }
+
         return {
             'prediction': predicted_class,
             'confidence': round(confidence_score, 2),
@@ -476,7 +672,7 @@ def health():
 
 @app.route('/')
 def home():
-    lang = request.args.get('lang', 'en')
+    lang = resolve_language()
     return render_template('home.html', lang=lang, t=lambda k: get_translation(k, lang))
 
 @app.route('/set_language/<lang>')
@@ -486,7 +682,7 @@ def set_language(lang):
 
 @app.route('/upload', methods=['GET', 'POST'])
 def upload():
-    lang = session.get('language', 'en')
+    lang = resolve_language()
     
     if request.method == 'POST':
         if 'file' not in request.files:
@@ -505,11 +701,16 @@ def upload():
             db_filepath = filepath.replace('\\', '/')
             
             # Predict
-            result = predict_image(filepath)
+            result = predict_image(filepath, lang=lang)
             
             if 'error' in result:
-                os.remove(filepath)
-                return jsonify({'error': result['error']}), 500
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                status_code = 400 if result.get('error_code') == NON_CATTLE_ERROR_CODE else 500
+                return jsonify({
+                    'error': result['error'],
+                    'error_code': result.get('error_code')
+                }), status_code
             
             # Get treatment recommendation
             treatment = get_treatment_recommendation(result['prediction'], lang)
@@ -657,10 +858,10 @@ def download_pdf(report_id):
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
-    lang = session.get('language', 'en')
+    lang = resolve_language()
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         
         conn = sqlite3.connect('database.db')
@@ -673,18 +874,18 @@ def admin_login():
         if user:
             session['user_id'] = user[0]
             session['role'] = user[1]
-            flash(get_translation('success_upload', lang), 'success')
+            flash(get_translation('admin_login_success', lang), 'success')
             return redirect(url_for('admin'))
         else:
-            flash('Invalid credentials', 'error')
-    
-    return render_template('admin.html', login_page=True, lang=lang, t=lambda k: get_translation(k, lang))
+            flash(get_translation('admin_login_invalid', lang), 'error')
+
+    return render_template('admin_login.html', lang=lang, t=lambda k: get_translation(k, lang))
 
 @app.route('/admin')
 def admin():
-    lang = session.get('language', 'en')
+    lang = resolve_language()
     if 'user_id' not in session or session.get('role') != 'admin':
-        return redirect(url_for('admin_login'))
+        return redirect(url_for('admin_login', lang=lang))
     
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
@@ -727,8 +928,9 @@ def admin():
 
 @app.route('/admin/logout')
 def admin_logout():
+    lang = session.get('language', 'en')
     session.clear()
-    flash('Logged out successfully', 'success')
+    flash(get_translation('logout_success', lang), 'success')
     return redirect(url_for('home'))
 
 @app.route('/api/stats')

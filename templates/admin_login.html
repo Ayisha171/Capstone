@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block title %}{{ t('admin') }} {{ t('login') }} - {{ t('app_name') }}{% endblock %}
+
+{% block content %}
+<section class="login-section">
+    <div class="login-container">
+        <div class="login-card">
+            <div class="login-header">
+                <i class="fas fa-lock"></i>
+                <h2>{{ t('admin') }} {{ t('login') }}</h2>
+                <p>{{ t('admin_login_subtitle') }}</p>
+            </div>
+            <form method="POST" action="{{ url_for('admin_login') }}">
+                <input type="hidden" name="lang" value="{{ lang }}">
+
+                <div class="form-group">
+                    <label for="username">
+                        <i class="fas fa-user"></i> {{ t('username') }}
+                    </label>
+                    <input type="text" id="username" name="username" required autocomplete="username">
+                </div>
+
+                <div class="form-group">
+                    <label for="password">
+                        <i class="fas fa-key"></i> {{ t('password') }}
+                    </label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password">
+                </div>
+
+                <button type="submit" class="btn btn-primary btn-block">
+                    <i class="fas fa-sign-in-alt"></i> {{ t('login') }}
+                </button>
+            </form>
+
+            <p class="login-hint">{{ t('admin_login_hint') }}</p>
+        </div>
+    </div>
+</section>
+{% endblock %}

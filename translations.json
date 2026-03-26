@@ -55,8 +55,14 @@
     "disease_detected": "Disease Detected",
     "no_reports": "No reports found",
     "error_upload": "Error uploading image. Please try again.",
+    "error_non_cattle": "The uploaded image is not cattle, please upload valid image.",
     "success_upload": "Image analyzed successfully!",
-    "confirm_delete": "Are you sure you want to delete this report?"
+    "confirm_delete": "Are you sure you want to delete this report?",
+    "admin_login_subtitle": "Sign in to access the admin dashboard.",
+    "admin_login_hint": "Default admin credentials: admin / admin123",
+    "admin_login_success": "Admin login successful.",
+    "admin_login_invalid": "Invalid admin credentials.",
+    "logout_success": "Logged out successfully."
   },
   "hi": {
     "app_name": "पशु रोग डिटेक्टर",

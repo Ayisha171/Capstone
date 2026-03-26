@@ -425,6 +425,27 @@ body {
     margin: 0 auto;
 }
 
+.upload-status {
+    display: none;
+    margin-bottom: 1rem;
+    padding: 0.9rem 1rem;
+    border-radius: 10px;
+    font-weight: 600;
+    border: 1px solid transparent;
+}
+
+.upload-status.error {
+    background: #fef2f2;
+    color: #991b1b;
+    border-color: #fecaca;
+}
+
+.upload-status.success {
+    background: #ecfdf5;
+    color: #065f46;
+    border-color: #a7f3d0;
+}
+
 .drop-zone {
     border: 3px dashed var(--border);
     border-radius: 12px;

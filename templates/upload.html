@@ -12,6 +12,7 @@
 
         <div class="upload-container">
             <div class="upload-area" id="uploadArea">
+                <div class="upload-status" id="uploadStatus" style="display: none;"></div>
                 <form id="uploadForm" enctype="multipart/form-data">
                     <div class="drop-zone" id="dropZone">
                         <i class="fas fa-cloud-upload-alt"></i>
@@ -150,6 +151,7 @@
     const locationInput = document.getElementById('location');
     const useLocationBtn = document.getElementById('useLocationBtn');
     const locationStatus = document.getElementById('locationStatus');
+    const uploadStatus = document.getElementById('uploadStatus');
 
     let currentReportId = null;
     let locationRequested = false;
@@ -236,6 +238,25 @@
         );
     }
 
+    function showUploadStatus(message, type = 'error') {
+        uploadStatus.textContent = message || '';
+        uploadStatus.className = 'upload-status';
+        if (type) {
+            uploadStatus.classList.add(type);
+        }
+        if (type === 'error') {
+            resultsContainer.style.display = 'none';
+            currentReportId = null;
+        }
+        uploadStatus.style.display = message ? 'block' : 'none';
+    }
+
+    function clearUploadStatus() {
+        uploadStatus.textContent = '';
+        uploadStatus.className = 'upload-status';
+        uploadStatus.style.display = 'none';
+    }
+
     function handleDrop(e) {
         const dt = e.dataTransfer;
         const files = dt.files;
@@ -248,8 +269,11 @@
     function handleFileSelect() {
         const file = fileInput.files[0];
         if (file) {
+            clearUploadStatus();
+            resultsContainer.style.display = 'none';
+            currentReportId = null;
             if (file.size > 16 * 1024 * 1024) {
-                alert('File size must be less than 16MB');
+                showUploadStatus('File size must be less than 16MB');
                 return;
             }
 
@@ -281,14 +305,16 @@
         document.getElementById('notes').value = '';
         cattleIdInput.dataset.auto = 'false';
         setLocationStatus('', '');
+        clearUploadStatus();
         locationRequested = false;
+        currentReportId = null;
     }
 
     async function handleSubmit(e) {
         e.preventDefault();
 
         const formData = new FormData(uploadForm);
-        
+        clearUploadStatus();
         loadingOverlay.style.display = 'flex';
 
         try {
@@ -307,17 +333,19 @@
             }
 
             if (!response.ok) {
-                throw new Error(data.error || `Request failed with status ${response.status}`);
+                showUploadStatus(data.error || `Request failed with status ${response.status}`);
+                return;
             }
 
             if (data.success) {
                 currentReportId = data.report_id;
+                clearUploadStatus();
                 displayResults(data);
             } else {
-                alert('Error: ' + (data.error || 'Unknown error occurred'));
+                showUploadStatus(data.error || 'Unknown error occurred');
             }
         } catch (error) {
-            alert('Error uploading image: ' + error.message);
+            showUploadStatus('Error uploading image: ' + error.message);
         } finally {
             loadingOverlay.style.display = 'none';
         }
